@@ -1,0 +1,12 @@
+[workspace]
+authors = ["Luke Thompson <luke.thompson@sydney.edu.au>"]
+channels = ["conda-forge"]
+name = "ees-dynamical-fitting"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+dmff = ">=1.0.0,<2"
+pip = ">=26.0.1,<27"

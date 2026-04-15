@@ -1,15 +1,11 @@
-import jax
 import jax.numpy as jnp
 from jax import jit, value_and_grad, vmap, grad, vjp, tree_util, custom_jvp
-from functools import partial
 from nblist import NeighborList
 
 
 class Loss_Generator:
-
     def __init__(self, f_nout, box, pos0, mass, dt, nsteps, nout, cov_map, rc, efunc):
-
-        """ Constructor
+        """Constructor
 
         Parameters
         ----------
@@ -32,7 +28,7 @@ class Loss_Generator:
         rc: float
             Cutoff distance in nblist.
         efunc: function
-            Potential energy function.            
+            Potential energy function.
 
         Examples
         ----------
@@ -58,36 +54,38 @@ class Loss_Generator:
 
         bonds = []
         for i in range(len(cov_map)):
-            bonds.append(jnp.concatenate([jnp.array([i]), jnp.where(cov_map[i] > 0)[0]]))
-        
+            bonds.append(
+                jnp.concatenate([jnp.array([i]), jnp.where(cov_map[i] > 0)[0]])
+            )
+
         @jit
         def regularize_pos(pos):
-            cpos = jnp.stack([jnp.sum(pos[bond], axis=0)/len(bond) for bond in bonds])
+            cpos = jnp.stack([jnp.sum(pos[bond], axis=0) / len(bond) for bond in bonds])
             box_inv = jnp.linalg.inv(box)
             spos = cpos.dot(box_inv)
             spos -= jnp.floor(spos)
             shift = spos.dot(box) - cpos
             return pos + shift
-        
-        self.states_axis = {'pos': 0, 'vel': 0}
+
+        self.states_axis = {"pos": 0, "vel": 0}
+
         # use leap-frog Verlet integration method (v_0.5, x1) -> (v_1.5, x2)
         @jit
         def vv_step(state, params):
-            x0 = state['pos']
-            v0 = state['vel']
+            x0 = state["pos"]
+            v0 = state["vel"]
             f0 = -grad(potential, argnums=(0))(x0, params)
             a0 = f0 / mass
             v1 = v0 + a0 * dt
             x1 = x0 + v1 * dt
-            v1 = v1 - jnp.sum(v1*mass, axis=0)/jnp.sum(mass, axis=0)
+            v1 = v1 - jnp.sum(v1 * mass, axis=0) / jnp.sum(mass, axis=0)
             x1 = regularize_pos(x1)
-            return {'pos': x1, 'vel':v1}   
-        
+            return {"pos": x1, "vel": v1}
+
         self.regularize_pos = regularize_pos
         self.vv_step = vv_step
 
-        return 
-    
+        return
 
     def ode_fwd(self, state, params):
         """
@@ -110,18 +108,22 @@ class Loss_Generator:
 
         def fwd(state):
             for i in range(self.nout):
-                state = vmap(self.vv_step, in_axes=(self.states_axis, None), out_axes=(0))(state, params)
+                state = vmap(
+                    self.vv_step, in_axes=(self.states_axis, None), out_axes=(0)
+                )(state, params)
             return state
+
         traj = {}
-        traj['time'] = jnp.zeros(self.nsteps//self.nout+1)
+        traj["time"] = jnp.zeros(self.nsteps // self.nout + 1)
         traj0 = self.f_nout(state)
-        traj['state'] = jnp.repeat(traj0[jnp.newaxis, ...], (self.nsteps//self.nout+1), axis=0)
-        for i in range(self.nsteps//self.nout):
+        traj["state"] = jnp.repeat(
+            traj0[jnp.newaxis, ...], (self.nsteps // self.nout + 1), axis=0
+        )
+        for i in range(self.nsteps // self.nout):
             state = fwd(state)
-            traj['time'] = traj['time'].at[i+1].set(self.nout*self.dt*(i+1))
-            traj['state'] = traj['state'].at[i+1].set(self.f_nout(state))
+            traj["time"] = traj["time"].at[i + 1].set(self.nout * self.dt * (i + 1))
+            traj["state"] = traj["state"].at[i + 1].set(self.f_nout(state))
         return state, traj
-  
 
     def _ode_bwd(self, state, params, gradient_traj):
         """
@@ -143,36 +145,46 @@ class Loss_Generator:
         gradient: dict
             Gradient of Loss with respect to params
         """
-        def batch_vjp(state, params, pairs, adjoint_state):
+
+        def batch_vjp(state, params, adjoint_state):
             primals, vv_vjp = vjp(self.vv_step, state, params)
             (grad_state, grad_params) = vv_vjp(adjoint_state)
             return grad_state, grad_params
-        
+
         def bwd(i, carry):
             state, adjoint_state, gradient, pos = carry
-            primals, f_vjp = vjp(self.f_nout, {'pos':pos, 'vel':-state['vel']})
-            adjoint_state = {key: adjoint_state[key] + f_vjp(gradient_traj[-(i+1)])[0][key] for key in state}            
+            primals, f_vjp = vjp(self.f_nout, {"pos": pos, "vel": -state["vel"]})
+            adjoint_state = {
+                key: adjoint_state[key] + f_vjp(gradient_traj[-(i + 1)])[0][key]
+                for key in state
+            }
             for j in range(self.nout):
-                pos = state['pos']
-                state = vmap(self.vv_step, in_axes=(self.states_axis, None), out_axes=(0))(state, params)
-                (grad_state, grad_params) = vmap(batch_vjp, in_axes=(self.states_axis, None, self.states_axis))({'pos':pos, 'vel':-state['vel']}, params, adjoint_state)
-                gradient = tree_util.tree_map(lambda p, u: p + jnp.sum(u, axis=0), gradient, grad_params)
-                adjoint_state = grad_state  
+                pos = state["pos"]
+                state = vmap(
+                    self.vv_step, in_axes=(self.states_axis, None), out_axes=(0)
+                )(state, params)
+                (grad_state, grad_params) = vmap(
+                    batch_vjp, in_axes=(self.states_axis, None, self.states_axis)
+                )({"pos": pos, "vel": -state["vel"]}, params, adjoint_state)
+                gradient = tree_util.tree_map(
+                    lambda p, u: p + jnp.sum(u, axis=0), gradient, grad_params
+                )
+                adjoint_state = grad_state
             return state, adjoint_state, gradient, pos
+
         adjoint_state = tree_util.tree_map(jnp.zeros_like, state)
         gradient = tree_util.tree_map(jnp.zeros_like, params)
-        pos = state['pos']
+        pos = state["pos"]
         # (v_1.5, x2) -> (-v_1.5, x1)
-        state['pos'] = state['pos'] - state['vel']*self.dt
-        state['pos'] = vmap(self.regularize_pos)(state['pos'])
-        state['vel'] = - state['vel']
+        state["pos"] = state["pos"] - state["vel"] * self.dt
+        state["pos"] = vmap(self.regularize_pos)(state["pos"])
+        state["vel"] = -state["vel"]
         carry = (state, adjoint_state, gradient, pos)
-        for i in range(self.nsteps//self.nout):
+        for i in range(self.nsteps // self.nout):
             carry = bwd(i, carry)
         state, adjoint_state, gradient, pos = carry
         return adjoint_state, gradient
 
-    
     def generate_Loss(self, L, has_aux=False, metadata=[]):
         """
         Generate Loss function
@@ -185,18 +197,19 @@ class Loss_Generator:
             If the L function returns auxiliary data
         metadata: []
             Record the traj and auxiliary data, {'traj':traj, 'aux_data':aux_data}
-        
+
         Returns:
         ----------
         Loss: function
             Loss function
 
         Examples:
-        ----------  
+        ----------
         """
+
         @custom_jvp
         def Loss(initial_state, params):
-            """ 
+            """
             This function returns the loss.
 
             Parameters
@@ -205,10 +218,10 @@ class Loss_Generator:
                 Initial state, {'pos': jnp.ndarray, 'vel': jnp.ndarray}
             params: dict
                 The parameter dictionary.
-            
+
             Returns:
             ----------
-            loss: float 
+            loss: float
                 Loss
 
             Examples:
@@ -216,13 +229,13 @@ class Loss_Generator:
             """
             final_state, traj = self.ode_fwd(initial_state, params)
             if has_aux == True:
-                loss, aux_data = L(traj['state'])
-                metadata.append({'traj':traj, 'aux_data':aux_data})
-            else: 
-                loss = L(traj['state'])
-                metadata.append({'traj':traj})
+                loss, aux_data = L(traj["state"])
+                metadata.append({"traj": traj, "aux_data": aux_data})
+            else:
+                loss = L(traj["state"])
+                metadata.append({"traj": traj})
             return loss
-        
+
         @Loss.defjvp
         def _f_jvp(primals, tangents):
             x, y = primals
@@ -230,14 +243,25 @@ class Loss_Generator:
             final_state, traj = self.ode_fwd(x, y)
             metadata.append(traj)
             if has_aux == True:
-                (primal_out, aux_data), gradient_traj = value_and_grad(L, has_aux=True)(traj['state'])
-                metadata.append({'traj':traj, 'aux_data':aux_data})
+                (primal_out, aux_data), gradient_traj = value_and_grad(L, has_aux=True)(
+                    traj["state"]
+                )
+                metadata.append({"traj": traj, "aux_data": aux_data})
             else:
-                primal_out, gradient_traj = value_and_grad(L)(traj['state'])
-                metadata.append({'traj':traj})
+                primal_out, gradient_traj = value_and_grad(L)(traj["state"])
+                metadata.append({"traj": traj})
             adjoint_state, gradient = self._ode_bwd(final_state, y, gradient_traj)
-            tangent_out = sum(tree_util.tree_leaves(tree_util.tree_map(lambda p, u: jnp.sum(p * u), adjoint_state, x_dot))) + sum(tree_util.tree_leaves(tree_util.tree_map(lambda p, u: jnp.sum(p * u), gradient, y_dot)))
+            tangent_out = sum(
+                tree_util.tree_leaves(
+                    tree_util.tree_map(
+                        lambda p, u: jnp.sum(p * u), adjoint_state, x_dot
+                    )
+                )
+            ) + sum(
+                tree_util.tree_leaves(
+                    tree_util.tree_map(lambda p, u: jnp.sum(p * u), gradient, y_dot)
+                )
+            )
             return primal_out, tangent_out
-        
+
         return Loss
-    
