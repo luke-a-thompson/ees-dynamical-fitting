@@ -25,6 +25,7 @@ import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+import json
 import pickle
 import time
 from collections.abc import Callable
@@ -33,18 +34,24 @@ from typing import ClassVar, cast
 import dmff
 import equinox as eqx
 import jax
+
 jax.config.update(
-    "jax_debug_nans", os.environ.get("EES_DEBUG_NANS", "").lower() in {"1", "true", "yes"}
+    "jax_debug_nans",
+    os.environ.get("EES_DEBUG_NANS", "").lower() in {"1", "true", "yes"},
 )
 jax.config.update(
-    "jax_debug_infs", os.environ.get("EES_DEBUG_INFS", "").lower() in {"1", "true", "yes"}
+    "jax_debug_infs",
+    os.environ.get("EES_DEBUG_INFS", "").lower() in {"1", "true", "yes"},
 )
 jax.config.update(
-    "jax_disable_jit", os.environ.get("EES_DISABLE_JIT", "").lower() in {"1", "true", "yes"}
+    "jax_disable_jit",
+    os.environ.get("EES_DISABLE_JIT", "").lower() in {"1", "true", "yes"},
 )
 jax.config.update(
     "jax_traceback_filtering",
-    "off" if os.environ.get("EES_FULL_TRACEBACK", "").lower() in {"1", "true", "yes"} else "auto",
+    "off"
+    if os.environ.get("EES_FULL_TRACEBACK", "").lower() in {"1", "true", "yes"}
+    else "auto",
 )
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -75,8 +82,8 @@ from diffrax import (
 )
 from diffrax._solution import update_result
 from diffrax_lowstorage import EES25
-from difftraj_ees import EES_Loss_Generator
 from eann import EANNForce
+from nblist import NeighborList
 
 ω = cast(Callable, ω)
 
@@ -136,6 +143,62 @@ def _tree_global_norm(tree):
     return max_abs * float(np.sqrt(scaled_total))
 
 
+def _tree_error_metrics(tree, reference_tree):
+    leaves = _array_leaves(tree)
+    ref_leaves = _array_leaves(reference_tree)
+    if len(leaves) != len(ref_leaves):
+        raise ValueError("gradient trees have different leaf counts")
+    if not leaves:
+        return {
+            "grad_mse": 0.0,
+            "grad_rmse": 0.0,
+            "grad_l2_error": 0.0,
+            "relative_grad_mse": 0.0,
+            "grad_cosine_similarity": 1.0,
+        }
+
+    max_abs = max(
+        max(float(jnp.max(jnp.abs(leaf))), float(jnp.max(jnp.abs(ref_leaf))))
+        for leaf, ref_leaf in zip(leaves, ref_leaves)
+    )
+    count = sum(leaf.size for leaf in leaves)
+    if max_abs == 0.0:
+        return {
+            "grad_mse": 0.0,
+            "grad_rmse": 0.0,
+            "grad_l2_error": 0.0,
+            "relative_grad_mse": 0.0,
+            "grad_cosine_similarity": 1.0,
+        }
+
+    sse_scaled = 0.0
+    ref_sse_scaled = 0.0
+    grad_sse_scaled = 0.0
+    dot_scaled = 0.0
+    for leaf, ref_leaf in zip(leaves, ref_leaves):
+        leaf_scaled = leaf / max_abs
+        ref_scaled = ref_leaf / max_abs
+        diff_scaled = leaf_scaled - ref_scaled
+        sse_scaled += float(jnp.sum(jnp.square(diff_scaled)))
+        ref_sse_scaled += float(jnp.sum(jnp.square(ref_scaled)))
+        grad_sse_scaled += float(jnp.sum(jnp.square(leaf_scaled)))
+        dot_scaled += float(jnp.sum(leaf_scaled * ref_scaled))
+
+    mse_scaled = sse_scaled / count
+    cosine_denom = np.sqrt(grad_sse_scaled * ref_sse_scaled)
+    return {
+        "grad_mse": (max_abs**2) * mse_scaled,
+        "grad_rmse": max_abs * float(np.sqrt(mse_scaled)),
+        "grad_l2_error": max_abs * float(np.sqrt(sse_scaled)),
+        "relative_grad_mse": (
+            sse_scaled / ref_sse_scaled if ref_sse_scaled > 0.0 else None
+        ),
+        "grad_cosine_similarity": (
+            dot_scaled / cosine_denom if cosine_denom > 0.0 else None
+        ),
+    }
+
+
 def _safe_clip_by_global_norm(max_norm):
     def init_fn(params):
         del params
@@ -172,6 +235,12 @@ def _assert_tree_finite(tree, label):
         raise FloatingPointError(f"{label} contains non-finite values")
 
 
+def _make_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 seed = 1234
 T = 298.15
 rc = 0.6
@@ -179,9 +248,8 @@ TOTAL_TIME = _env_float("EES_TOTAL_TIME", 0.1)
 NFE_BUDGET = _env_int(
     "EES_NFE_BUDGET", 252
 )  # divisible by Euler(2), Midpoint(4), EES25/ReversibleHeun(3)
-nout = 1
-batch_size = _env_int("EES_BATCH_SIZE", 4)
-n_train_steps = _env_int("EES_N_TRAIN_STEPS", 20)
+batch_size = _env_int("EES_BATCH_SIZE", 6)
+n_train_steps = _env_int("EES_N_TRAIN_STEPS", 250)
 lr = _env_float("EES_LR", 5e-4)
 grad_clip = _env_float("EES_GRAD_CLIP", 1.0)
 gamma_langevin = _env_float("EES_GAMMA", 1.0)
@@ -189,6 +257,11 @@ rollout_mode = os.environ.get("EES_ROLLOUT_MODE", "sde").strip().lower()
 output_path = os.environ.get(
     "EES_OUTPUT", os.path.join("IR-fitting", "benchmark_ees_loss.png")
 )
+metrics_path = os.environ.get(
+    "EES_METRICS", os.path.join("IR-fitting", "benchmark_ees_metrics.json")
+)
+grad_ref_solver = os.environ.get("EES_GRAD_REF_SOLVER", "").strip()
+grad_ref_nfe_budget = _env_int("EES_GRAD_REF_NFE_BUDGET", NFE_BUDGET)
 key = random.PRNGKey(seed)
 solver_filter = {
     name.strip()
@@ -242,9 +315,11 @@ def _load_legacy_params(path):
 
 _param_candidates = ["IR-fitting/params_eann4.pickle", "params.pickle"]
 params = None
+params_path = None
 for _pfile in _param_candidates:
     if os.path.exists(_pfile):
         params = {"energy": _load_legacy_params(_pfile)}
+        params_path = _pfile
         print(f"Loaded EANN params from {_pfile}")
         break
 if params is None:
@@ -260,18 +335,6 @@ def efunc1(pos, box, pairs, params):
         eann_force1.get_energy(pos * 10, box * 10, pairs, params["energy"])
     )
     return _finite_guard(energy, "efunc1.energy")
-
-
-# ── Observable ────────────────────────────────────────────────────────────────
-
-
-def f_nout_simple(state):
-    pos = state["pos"]
-    n_mol = pos.shape[-2] // 3
-    mol_pos = pos.reshape(pos.shape[0], n_mol, 3, 3)
-    weights = jnp.array([1.0, -0.5, -0.5])
-    dipole = jnp.einsum("bmad,a->bmd", mol_pos, weights)
-    return jnp.sum(dipole, axis=1)  # (batch, 3)
 
 
 # ── UReversible wrapper (local copy; installed Diffrax doesn't init `solver`) ─
@@ -330,9 +393,7 @@ class _PatchedUReversible(AbstractReversibleSolver):
         dense_info = dict(y0=y0, y1=y1)
         return y1, y_error, dense_info, z1, update_result(result1, result2)
 
-    def backward_step(
-        self, terms, t0, t1, y1, args, ts_state, solver_state, made_jump
-    ):
+    def backward_step(self, terms, t0, t1, y1, args, ts_state, solver_state, made_jump):
         del made_jump, ts_state
         z1 = solver_state
         step_y1, _, _, _, result1 = self.solver.step(
@@ -355,34 +416,65 @@ class _PatchedUReversible(AbstractReversibleSolver):
 SOLVER_NFE_PER_STEP = {
     "Euler": 2,
     "Midpoint": 4,
-    "ReversibleHeun": 3,
+    "ReversibleHeun": 1,
     "EES25": 3,
 }
 
 
-def _solver_dt_nsteps(solver_name):
+def _solver_dt_nsteps(solver_name, nfe_budget=NFE_BUDGET):
     nfe_per_step = SOLVER_NFE_PER_STEP[solver_name]
-    if NFE_BUDGET % nfe_per_step != 0:
+    if nfe_budget % nfe_per_step != 0:
         raise ValueError(
-            f"NFE budget {NFE_BUDGET} is not divisible by {solver_name} cost {nfe_per_step}."
+            f"NFE budget {nfe_budget} is not divisible by "
+            f"{solver_name} cost {nfe_per_step}."
         )
-    nsteps = NFE_BUDGET // nfe_per_step
+    nsteps = nfe_budget // nfe_per_step
     return TOTAL_TIME / nsteps, nsteps
 
 
-# ── Shared generator helpers (provides potential and mass) ────────────────────
+# ── Shared MD helpers ─────────────────────────────────────────────────────────
 
-print("\nBuilding EES25 generator...")
-gen_ees = EES_Loss_Generator(
-    # Only `mass`, `potential`, and `regularize_pos` are used below, so the
-    # benchmark does not need an EES25-compatible NFE budget just to build this.
-    f_nout_simple,
-    box1,
-    pos1,
-    mass,
-    dt=TOTAL_TIME,
-    nsteps=1,
-    nout=nout,
+
+class BenchmarkSystem:
+    """Shared mass, potential, and PBC helpers used by every benchmark solver."""
+
+    def __init__(self, box, pos0, mass, cov_map, rc, efunc):
+        self.mass = jnp.tile(mass.reshape([len(mass), 1]), (1, 3))
+
+        nbl = NeighborList(box, rc, cov_map)
+        nbl.allocate(pos0)
+
+        @jit
+        def potential(pos, params):
+            nblist = nbl.nblist.update(pos)
+            pairs = nblist.idx.T
+            nbond = cov_map[pairs[:, 0], pairs[:, 1]]
+            pairs_b = jnp.concatenate([pairs, nbond[:, None]], axis=1)
+            return efunc(pos, box, pairs_b, params)
+
+        bonds = [
+            jnp.concatenate([jnp.array([i]), jnp.where(cov_map[i] > 0)[0]])
+            for i in range(len(cov_map))
+        ]
+
+        @jit
+        def regularize_pos(pos):
+            cpos = jnp.stack([jnp.sum(pos[bond], axis=0) / len(bond) for bond in bonds])
+            box_inv = jnp.linalg.inv(box)
+            spos = cpos.dot(box_inv)
+            spos -= jnp.floor(spos)
+            shift = spos.dot(box) - cpos
+            return pos + shift
+
+        self.potential = potential
+        self.regularize_pos = regularize_pos
+
+
+print("\nBuilding shared MD helpers...")
+system = BenchmarkSystem(
+    box=box1,
+    pos0=pos1,
+    mass=mass,
     cov_map=cov_map1,
     rc=rc,
     efunc=efunc1,
@@ -427,8 +519,8 @@ def make_langevin_fwd_bwd(
     if mode not in {"sde", "fixed_noise"}:
         raise ValueError("mode must be either 'sde' or 'fixed_noise'.")
 
-    mass_2d = gen_ees.mass  # (natoms, 3)
-    potential = gen_ees.potential
+    mass_2d = system.mass  # (natoms, 3)
+    potential = system.potential
     sigma = jnp.sqrt(2.0 * gamma * kT * 1e-3 / mass_2d)
 
     t_end = nsteps * dt
@@ -534,7 +626,7 @@ def make_langevin_fwd_bwd(
         return final_loss / loss_normalizer
 
     def fwd_bwd(state_init, params):
-        pos_reg = vmap(gen_ees.regularize_pos)(state_init["pos"])
+        pos_reg = vmap(system.regularize_pos)(state_init["pos"])
         pos_reg = _finite_guard(pos_reg, "fwd_bwd.pos_reg")
         pos_all = jnp.concatenate([pos_reg, pos_reg])
         vel_all = jnp.concatenate([-state_init["vel"], state_init["vel"]])
@@ -574,13 +666,42 @@ SOLVER_SPECS = [
     ("ReversibleHeun", ReversibleHeun),
     ("EES25", EES25),
 ]
+ALL_SOLVER_FACTORIES = dict(SOLVER_SPECS)
+
+if grad_ref_solver and grad_ref_solver not in ALL_SOLVER_FACTORIES:
+    raise ValueError(
+        f"EES_GRAD_REF_SOLVER={grad_ref_solver!r} did not match any known solver."
+    )
 
 if solver_filter:
-    SOLVER_SPECS = [(name, factory) for name, factory in SOLVER_SPECS if name in solver_filter]
+    SOLVER_SPECS = [
+        (name, factory) for name, factory in SOLVER_SPECS if name in solver_filter
+    ]
     if not SOLVER_SPECS:
         raise ValueError(
             f"EES_SOLVERS={sorted(solver_filter)} did not match any known solver."
         )
+
+grad_ref_cfg = None
+grad_ref_fwd_bwd = None
+if grad_ref_solver:
+    grad_ref_dt, grad_ref_nsteps = _solver_dt_nsteps(
+        grad_ref_solver, grad_ref_nfe_budget
+    )
+    grad_ref_fwd_bwd = make_langevin_fwd_bwd(
+        ALL_SOLVER_FACTORIES[grad_ref_solver](),
+        dt=grad_ref_dt,
+        nsteps=grad_ref_nsteps,
+        gamma=gamma_langevin,
+        mode=rollout_mode,
+    )
+    grad_ref_cfg = {
+        "solver": grad_ref_solver,
+        "nfe_budget": grad_ref_nfe_budget,
+        "nfe_per_step": SOLVER_NFE_PER_STEP[grad_ref_solver],
+        "dt": grad_ref_dt,
+        "nsteps": grad_ref_nsteps,
+    }
 
 SOLVERS = {}
 for solver_name, solver_factory in SOLVER_SPECS:
@@ -613,6 +734,7 @@ if any(
         bool(solver_filter),
         rollout_mode != "sde",
         grad_clip != 1.0,
+        bool(grad_ref_solver),
     ]
 ):
     print("Diagnostic flags:")
@@ -632,6 +754,12 @@ if any(
         print(f"  EES_ROLLOUT_MODE={rollout_mode}")
     if grad_clip != 1.0:
         print(f"  EES_GRAD_CLIP={grad_clip}")
+    if grad_ref_cfg is not None:
+        print(
+            "  EES_GRAD_REF_SOLVER="
+            f"{grad_ref_cfg['solver']}  EES_GRAD_REF_NFE_BUDGET="
+            f"{grad_ref_cfg['nfe_budget']}"
+        )
 print(
     f"System: {natoms1} atoms, t_end={TOTAL_TIME} ps, "
     f"NFE budget={NFE_BUDGET}, batch_size={batch_size}, n_train_steps={n_train_steps}"
@@ -648,10 +776,19 @@ for name, cfg in SOLVERS.items():
         f"  nsteps={cfg['nsteps']}"
         f"  nfe/step={cfg['nfe_per_step']}"
     )
+if grad_ref_cfg is not None:
+    print(
+        f"  {'grad ref: ' + grad_ref_cfg['solver']:<{COL}}  "
+        f"dt={grad_ref_cfg['dt']:.12f} ps"
+        f"  nsteps={grad_ref_cfg['nsteps']}"
+        f"  nfe/step={grad_ref_cfg['nfe_per_step']}"
+    )
 
 print(f"\n--- Training ({n_train_steps} steps) ---")
 all_losses = {}
 train_times = {}
+solver_metrics = {}
+benchmark_started_at = time.time()
 
 for name, cfg in SOLVERS.items():
     fwd_bwd = cfg["fwd_bwd"]
@@ -664,6 +801,7 @@ for name, cfg in SOLVERS.items():
     opt_state = opt.init(p)
     losses = []
     step_times = []
+    step_records = []
     for step in range(n_train_steps):
         t0 = time.time()
         try:
@@ -676,6 +814,24 @@ for name, cfg in SOLVERS.items():
         loss_value = _assert_finite_scalar(loss, f"{name} loss at step {step}")
         _assert_tree_finite(g, f"{name} gradient at step {step}")
         grad_norm = _tree_global_norm(g)
+        grad_error = None
+        if grad_ref_fwd_bwd is not None:
+            ref_t0 = time.time()
+            ref_loss, ref_g = grad_ref_fwd_bwd(state_init, p)
+            jax.block_until_ready((ref_loss, ref_g))
+            ref_time = time.time() - ref_t0
+            ref_loss_value = _assert_finite_scalar(
+                ref_loss, f"{name} reference loss at step {step}"
+            )
+            _assert_tree_finite(ref_g, f"{name} reference gradient at step {step}")
+            grad_error = _tree_error_metrics(g, ref_g)
+            grad_error.update(
+                {
+                    "reference_loss": ref_loss_value,
+                    "reference_grad_norm": _tree_global_norm(ref_g),
+                    "reference_time_seconds": ref_time,
+                }
+            )
         updates, opt_state = opt.update(g, opt_state, p)
         jax.block_until_ready((updates, opt_state))
         _assert_tree_finite(updates, f"{name} optimiser update at step {step}")
@@ -684,12 +840,39 @@ for name, cfg in SOLVERS.items():
         _assert_tree_finite(p, f"{name} parameters after step {step}")
         losses.append(loss_value)
         tag = " (warmup)" if step == 0 else ""
+        step_records.append(
+            {
+                "step": step,
+                "loss": loss_value,
+                "grad_norm": grad_norm,
+                "step_time_seconds": step_times[-1],
+                "warmup": step == 0,
+                **(grad_error or {}),
+            }
+        )
+        grad_tag = f"  grad_mse={grad_error['grad_mse']:.3e}" if grad_error else ""
         print(
             f"  [{name:<{COL}}] step {step:3d}  loss={loss_value:.6f}"
-            f"  |grad|={grad_norm:.3e}  {step_times[-1]:.2f}s{tag}"
+            f"  |grad|={grad_norm:.3e}{grad_tag}  {step_times[-1]:.2f}s{tag}"
         )
     all_losses[name] = losses
     train_times[name] = sum(step_times)
+    grad_mses = [record["grad_mse"] for record in step_records if "grad_mse" in record]
+    solver_metrics[name] = {
+        "final_loss": losses[-1],
+        "dt": cfg["dt"],
+        "nsteps": cfg["nsteps"],
+        "nfe_per_step": cfg["nfe_per_step"],
+        "nfe_budget": cfg["nsteps"] * cfg["nfe_per_step"],
+        "train_seconds": train_times[name],
+        "train_seconds_excluding_warmup": sum(step_times[1:]),
+        "step_times_seconds": step_times,
+        "losses": losses,
+        "grad_mses": grad_mses,
+        "final_grad_mse": grad_mses[-1] if grad_mses else None,
+        "mean_grad_mse": float(np.mean(grad_mses)) if grad_mses else None,
+        "steps": step_records,
+    }
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
 
@@ -703,12 +886,54 @@ ax.set_title(f"Loss during training (Langevin NVT, {rollout_mode})")
 ax.legend()
 ax.grid(True, alpha=0.3)
 plt.tight_layout()
-output_dir = os.path.dirname(output_path)
-if output_dir:
-    os.makedirs(output_dir, exist_ok=True)
+_make_parent_dir(output_path)
 plt.savefig(output_path, dpi=150)
 print(f"\nPlot saved to {output_path}")
 plt.close()
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+
+metrics = {
+    "schema_version": 1,
+    "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "total_wall_seconds": time.time() - benchmark_started_at,
+    "config": {
+        "seed": seed,
+        "temperature_kelvin": T,
+        "cutoff_nm": rc,
+        "total_time_ps": TOTAL_TIME,
+        "nfe_budget": NFE_BUDGET,
+        "batch_size": batch_size,
+        "n_train_steps": n_train_steps,
+        "learning_rate": lr,
+        "grad_clip": grad_clip,
+        "gamma_ps_inv": gamma_langevin,
+        "rollout_mode": rollout_mode,
+        "solver_filter": sorted(solver_filter),
+        "debug_finite": DEBUG_FINITE,
+        "jax_debug_nans": _env_flag("EES_DEBUG_NANS"),
+        "jax_debug_infs": _env_flag("EES_DEBUG_INFS"),
+        "jax_disable_jit": _env_flag("EES_DISABLE_JIT"),
+        "grad_reference": grad_ref_cfg,
+    },
+    "system": {
+        "natoms": natoms1,
+        "nmolecules": natoms1 // 3,
+        "pdb_path": "IR-fitting/water64.pdb",
+        "cov_map_path": "IR-fitting/cov_map",
+        "params_path": params_path,
+    },
+    "paths": {
+        "plot": output_path,
+        "metrics": metrics_path,
+    },
+    "solvers": solver_metrics,
+}
+
+_make_parent_dir(metrics_path)
+with open(metrics_path, "w", encoding="utf-8") as f:
+    json.dump(metrics, f, indent=2, sort_keys=True)
+print(f"Metrics saved to {metrics_path}")
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 

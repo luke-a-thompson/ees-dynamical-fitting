@@ -241,10 +241,13 @@ class EANNForce:
         """
 
         dist_vec = jnp.concatenate((dr, -dr), axis=0)
-        dr_norm = jnp.linalg.norm(dist_vec, axis=1)
-        f_cut = cutoff_cosine(dr_norm, self.rc)
         neigh_list = jnp.concatenate((pairs, pairs[:, [1, 0]]), axis=0)
         buffer_scales_ = jnp.concatenate((buffer_scales, buffer_scales), axis=0)
+        dist_sq = jnp.sum(dist_vec**2, axis=1)
+        dr_norm = jnp.sqrt(
+            jnp.where(buffer_scales_ > 0, dist_sq, jnp.ones_like(dist_sq))
+        )
+        f_cut = cutoff_cosine(dr_norm, self.rc)
         prefacs = f_cut.reshape(1, -1)
         angular = prefacs
         for ipsin in range(1, self.nipsin + 1):
@@ -308,7 +311,12 @@ class EANNForce:
             dr = rj - ri
             dr = pbc_shift(dr, box, box_inv)
 
-            dr_norm = jnp.linalg.norm(dr, axis=1)
+            dr_sq = jnp.sum(dr**2, axis=1)
+            # Safe norm: padding pairs (buffer_scales=0) have dr=[0,0,0]; avoid NaN
+            # gradient of sqrt at 0 by substituting 1.0 for masked pairs.
+            dr_norm = jnp.sqrt(
+                jnp.where(buffer_scales > 0, dr_sq, jnp.ones_like(dr_sq))
+            )
 
             buffer_scales2 = jnp.piecewise(
                 buffer_scales,
@@ -374,7 +382,10 @@ class EANNForce:
             dr = rj - ri
             dr = pbc_shift(dr, box, box_inv)
 
-            dr_norm = jnp.linalg.norm(dr, axis=1)
+            dr_sq = jnp.sum(dr**2, axis=1)
+            dr_norm = jnp.sqrt(
+                jnp.where(buffer_scales > 0, dr_sq, jnp.ones_like(dr_sq))
+            )
 
             buffer_scales2 = jnp.piecewise(
                 buffer_scales,

@@ -10,3 +10,6 @@ version = "0.1.0"
 [dependencies]
 dmff = ">=1.0.0,<2"
 pip = ">=26.0.1,<27"
+
+[pypi-dependencies]
+diffrax-lowstorage = { git = "https://github.com/luke-a-thompson/diffrax-lowstorage.git" }

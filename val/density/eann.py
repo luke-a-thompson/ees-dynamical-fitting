@@ -1,45 +1,48 @@
 #!/usr/bin/env python
-import sys
 import jax
 import jax.numpy as jnp
-from jax import vmap, jit, value_and_grad
-import numpy as np
+from jax import vmap
 from dmff.utils import jit_condition, regularize_pairs, pair_buffer_scales
-from dmff.admp.pairwise import distribute_scalar, distribute_v3
+from dmff.admp.pairwise import distribute_v3
 from dmff.admp.spatial import pbc_shift
 from functools import partial
 import jax.nn.initializers
-import pickle
 # from jax.config import config
 # config.update("jax_debug_nans", True)
+
 
 # Make printing parameters a little more readable
 def parameter_shapes(params):
     return jax.tree_util.tree_map(lambda p: p.shape, params)
 
+
 @jit_condition(static_argnums=())
-@partial(vmap, in_axes=(0, 0, None, None, None, None), out_axes=(0,0))
+@partial(vmap, in_axes=(0, 0, None, None, None, None), out_axes=(0, 0))
 def get_gto(r, pairs, rc, rs, inta, species):
-    gto_i = jnp.exp(-inta[species[pairs[1]]] * (r - rs[species[pairs[1]]])**2)
-    gto_j = jnp.exp(-inta[species[pairs[0]]] * (r - rs[species[pairs[0]]])**2)
+    gto_i = jnp.exp(-inta[species[pairs[1]]] * (r - rs[species[pairs[1]]]) ** 2)
+    gto_j = jnp.exp(-inta[species[pairs[0]]] * (r - rs[species[pairs[0]]]) ** 2)
     return gto_i, gto_j
+
 
 @jit_condition(static_argnums=())
 @partial(vmap, in_axes=(0, None), out_axes=0)
 def cutoff_cosine(distances, cutoff):
     return jnp.square(0.5 * jnp.cos(distances * (jnp.pi / cutoff)) + 0.5)
 
+
 @jit_condition(static_argnums=())
 @partial(vmap, in_axes=(0, 0, None), out_axes=0)
 def distribute_pair_cij(i_elem, j_elem, cij):
     return cij[j_elem]
-    
+
+
 @jit_condition(static_argnums=())
-@partial(vmap, in_axes=(0, None, None, None), out_axes=(0)) 
+@partial(vmap, in_axes=(0, None, None, None), out_axes=(0))
 def reduce_atoms(i_atom, wfs, indices, buffer_scales):
-    mask = (indices == i_atom)
-    res = jnp.einsum('ijk,i,i', wfs, mask, buffer_scales)
+    mask = indices == i_atom
+    res = jnp.einsum("ijk,i,i", wfs, mask, buffer_scales)
     return res
+
 
 def layer_norm(x, weight, bias, axis=-1, eps=1e-5):
     mean = jnp.mean(x, axis=-1, keepdims=True)
@@ -48,32 +51,50 @@ def layer_norm(x, weight, bias, axis=-1, eps=1e-5):
     y = (x - mean) / std * weight + bias
     return y
 
+
 # calculate neural network energy through features
 # Linear, LayerNorm, Relu_Like, Linear, LayerNorm, Relu_Like, Linear
 @jit_condition(static_argnums=())
 @partial(vmap, in_axes=(0, 0, None), out_axes=(0))
 def get_atomic_energies(features, elem_index, params):
     # 0 Linear
-    features1 = features.dot(params['w'][0][elem_index]) + params['b'][0][elem_index]
+    features1 = features.dot(params["w"][0][elem_index]) + params["b"][0][elem_index]
     # 1 LayerNorm
-    features2 = layer_norm(features1, params['w'][1][elem_index], params['b'][1][elem_index])
+    features2 = layer_norm(
+        features1, params["w"][1][elem_index], params["b"][1][elem_index]
+    )
     # 2 Relu_Like
-    features3 = params['w'][2][elem_index] * jax.nn.silu(features2 * params['b'][2][elem_index])
-    # 3 Linear 
-    features4 = features3.dot(params['w'][3][elem_index]) + params['b'][3][elem_index]
+    features3 = params["w"][2][elem_index] * jax.nn.silu(
+        features2 * params["b"][2][elem_index]
+    )
+    # 3 Linear
+    features4 = features3.dot(params["w"][3][elem_index]) + params["b"][3][elem_index]
     # 4 LayerNorm
-    features5 = layer_norm(features4, params['w'][4][elem_index], params['b'][4][elem_index])
-    # 5 Relu_Like 
-    features6 = params['w'][5][elem_index] * jax.nn.silu(features5 * params['b'][5][elem_index])
-    # 6 Linear 
-    features7 = features6.dot(params['w'][6][elem_index]) + params['b'][6][elem_index]
+    features5 = layer_norm(
+        features4, params["w"][4][elem_index], params["b"][4][elem_index]
+    )
+    # 5 Relu_Like
+    features6 = params["w"][5][elem_index] * jax.nn.silu(
+        features5 * params["b"][5][elem_index]
+    )
+    # 6 Linear
+    features7 = features6.dot(params["w"][6][elem_index]) + params["b"][6][elem_index]
     return features7
 
 
 class EANNForce:
-
-    def __init__(self, n_elem, elem_indices, n_gto, rc, nipsin=2, beta=0.2, sizes=(20, 20), seed=12345):
-        """ Constructor
+    def __init__(
+        self,
+        n_elem,
+        elem_indices,
+        n_gto,
+        rc,
+        nipsin=2,
+        beta=0.2,
+        sizes=(20, 20),
+        seed=12345,
+    ):
+        """Constructor
 
         Parameters
         ----------
@@ -110,7 +131,7 @@ class EANNForce:
         self.n_atoms = len(elem_indices)
 
         # n_elements * n_features
-        self.n_features = (nipsin+1) * n_gto
+        self.n_features = (nipsin + 1) * n_gto
         cij = jnp.ones((n_elem, n_gto)) * 0.0
         rs, inta = self.get_init_rs(n_gto, beta, rc)
         initpot = jnp.ones(1) * 0.0
@@ -133,9 +154,9 @@ class EANNForce:
             # LayerNorm
             W.append(initializer(subkey, (n_elem, dim_out)))
             B.append(jnp.zeros((n_elem, dim_out)))
-            # Relu_like 
+            # Relu_like
             W.append(initializer(subkey, (n_elem, 1, dim_out)))
-            B.append(jnp.zeros((n_elem, 1, dim_out)))            
+            B.append(jnp.zeros((n_elem, 1, dim_out)))
             dim_in = dim_out
         key, subkey = jax.random.split(key)
         W.append(initializer(subkey, (n_elem, dim_in)))
@@ -146,18 +167,20 @@ class EANNForce:
         # weights: weights[i_layer][n_elem, dim_in, dim_out]
         # bias: bias[i_layer][n_elem, dim_out]
         self.params = {
-                'w': W,
-                'b': B,
-                'c': cij,
-                'rs': rs,
-                'inta': inta,
-                'initpot': initpot
-                }
+            "w": W,
+            "b": B,
+            "c": cij,
+            "rs": rs,
+            "inta": inta,
+            "initpot": initpot,
+        }
         # prepare angular channels
         npara = [1]
-        for i in range(1,self.nipsin+1):
+        for i in range(1, self.nipsin + 1):
             npara.append(3**i)
-        self.index_para = jnp.concatenate([jnp.ones((npara[i],), dtype=jnp.int32) * i for i in range(len(npara))])
+        self.index_para = jnp.concatenate(
+            [jnp.ones((npara[i],), dtype=jnp.int32) * i for i in range(len(npara))]
+        )
 
         # generate get_energy
         self.get_energy = self.generate_get_energy()
@@ -180,7 +203,7 @@ class EANNForce:
 
         Returns
         ----------
-        rs: 
+        rs:
             (3, n_gto): list of rs (for different radial channels)
         inta:
             (3, n_gto): list of inta
@@ -189,17 +212,17 @@ class EANNForce:
         a = beta / drs / drs
         # rs = jnp.arange(0, rc, drs)
         # inta = jnp.ones(n_gto) * a
-        rs=jnp.stack([jnp.arange(0, rc, drs) for itype in range(self.n_elem)],axis=0)
-        inta=jnp.stack([jnp.ones(n_gto) * a for itype in range(self.n_elem)],axis=0)
+        rs = jnp.stack([jnp.arange(0, rc, drs) for itype in range(self.n_elem)], axis=0)
+        inta = jnp.stack([jnp.ones(n_gto) * a for itype in range(self.n_elem)], axis=0)
         return rs, inta
 
     def get_features(self, radial, dr, pairs, buffer_scales, orb_coeff):
-        """ Get atomic features from pairwise gto arrays
-        
+        """Get atomic features from pairwise gto arrays
+
         Parameters
         ----------
         gtos(radial): array, (2, n_pairs, nipsin+1, n_gtos)
-            pairwise gto values, that is, 
+            pairwise gto values, that is,
             cij * exp(-inta * (r-rs)**2) * 0.25*(cos(r/rc*pi) + 1)**2
         dr: array
             dr_vec for each pair, pbc shifted
@@ -217,32 +240,37 @@ class EANNForce:
         ----------
         """
 
-        dist_vec = jnp.concatenate((dr,-dr),axis=0)
+        dist_vec = jnp.concatenate((dr, -dr), axis=0)
         dr_norm = jnp.linalg.norm(dist_vec, axis=1)
         f_cut = cutoff_cosine(dr_norm, self.rc)
-        neigh_list = jnp.concatenate((pairs,pairs[:,[1,0]]),axis=0)
-        buffer_scales_ = jnp.concatenate((buffer_scales,buffer_scales),axis=0)
+        neigh_list = jnp.concatenate((pairs, pairs[:, [1, 0]]), axis=0)
+        buffer_scales_ = jnp.concatenate((buffer_scales, buffer_scales), axis=0)
         prefacs = f_cut.reshape(1, -1)
         angular = prefacs
-        for ipsin in range(1,self.nipsin+1):
-            prefacs = jnp.einsum("ji,ki->jki", prefacs, dist_vec.T).reshape(-1, neigh_list.shape[0])
+        for ipsin in range(1, self.nipsin + 1):
+            prefacs = jnp.einsum("ji,ki->jki", prefacs, dist_vec.T).reshape(
+                -1, neigh_list.shape[0]
+            )
             angular = jnp.vstack((angular, prefacs))
         orbital = jnp.einsum("ji,ik->ijk", angular, radial)
-        expandpara = orb_coeff[neigh_list[:,1],:] 
-        worbital = jnp.einsum("ijk,ik,i->ijk", orbital, expandpara, buffer_scales_) 
-        sum_worbital = jnp.zeros((self.n_atoms, orbital.shape[1], self.rs.shape[1]), dtype=orbital.dtype) 
-        sum_worbital = sum_worbital.at[neigh_list[:,0], :, :].add(worbital)
-        features = jnp.zeros((self.n_atoms, self.nipsin+1, self.rs.shape[1]), dtype=orbital.dtype) 
-        features = features.at[:,self.index_para,:].add(jnp.square(sum_worbital)) 
-        features = features.reshape(self.n_atoms,-1)
+        expandpara = orb_coeff[neigh_list[:, 1], :]
+        worbital = jnp.einsum("ijk,ik,i->ijk", orbital, expandpara, buffer_scales_)
+        sum_worbital = jnp.zeros(
+            (self.n_atoms, orbital.shape[1], self.rs.shape[1]), dtype=orbital.dtype
+        )
+        sum_worbital = sum_worbital.at[neigh_list[:, 0], :, :].add(worbital)
+        features = jnp.zeros(
+            (self.n_atoms, self.nipsin + 1, self.rs.shape[1]), dtype=orbital.dtype
+        )
+        features = features.at[:, self.index_para, :].add(jnp.square(sum_worbital))
+        features = features.reshape(self.n_atoms, -1)
         return features
-
 
     def generate_get_energy(self):
 
         @jit_condition(static_argnums=())
         def get_energy(positions, box, pairs, params):
-            """ Get energy
+            """Get energy
             This function returns the EANN energy.
 
             Parameters
@@ -260,7 +288,7 @@ class EANNForce:
                 inta: the exponents, (n_gto,)
                 w: weights of NN, list of (n_elem, dim_in, dime_out) array, with a length of n_layer
                 b: bias of NN, list of (n_elem, dim_out) array, with a length of n_layer
-            
+
             Returns:
             ----------
             energy: float or double
@@ -269,7 +297,7 @@ class EANNForce:
             Examples:
             ----------
             """
-            pairs = pairs[:,:2]
+            pairs = pairs[:, :2]
             pairs = regularize_pairs(pairs)
             buffer_scales = pair_buffer_scales(pairs)
 
@@ -282,20 +310,25 @@ class EANNForce:
 
             dr_norm = jnp.linalg.norm(dr, axis=1)
 
-            buffer_scales2 = jnp.piecewise(buffer_scales, (dr_norm <= 6, dr_norm > 6),
-                            (lambda x: jnp.array(1), lambda x: jnp.array(0)))
+            buffer_scales2 = jnp.piecewise(
+                buffer_scales,
+                (dr_norm <= 6, dr_norm > 6),
+                (lambda x: jnp.array(1), lambda x: jnp.array(0)),
+            )
             buffer_scales = buffer_scales2 * buffer_scales
 
-            self.rs = params['rs']
-            self.inta = params['inta']
+            self.rs = params["rs"]
+            self.inta = params["inta"]
 
-            radial_i, radial_j = get_gto(dr_norm, pairs, self.rc, self.rs, self.inta, self.elem_indices)
-            radial = jnp.concatenate((radial_i,radial_j), axis=0)
-            orb_coeff = params['c'][self.elem_indices,:] # (48,16)
+            radial_i, radial_j = get_gto(
+                dr_norm, pairs, self.rc, self.rs, self.inta, self.elem_indices
+            )
+            radial = jnp.concatenate((radial_i, radial_j), axis=0)
+            orb_coeff = params["c"][self.elem_indices, :]  # (48,16)
 
             features = self.get_features(radial, dr, pairs, buffer_scales, orb_coeff)
             atomic_energies = get_atomic_energies(features, self.elem_indices, params)
-            return jnp.sum(atomic_energies + params['initpot'][0])
+            return jnp.sum(atomic_energies + params["initpot"][0])
 
         return get_energy
 
@@ -303,7 +336,7 @@ class EANNForce:
 
         @jit_condition(static_argnums=())
         def get_charge(positions, box, pairs, params):
-            """ Get energy
+            """Get energy
             This function returns the EANN energy.
 
             Parameters
@@ -321,7 +354,7 @@ class EANNForce:
                 inta: the exponents, (n_gto,)
                 w: weights of NN, list of (n_elem, dim_in, dime_out) array, with a length of n_layer
                 b: bias of NN, list of (n_elem, dim_out) array, with a length of n_layer
-            
+
             Returns:
             ----------
             energy: float or double
@@ -330,7 +363,7 @@ class EANNForce:
             Examples:
             ----------
             """
-            pairs = pairs[:,:2]
+            pairs = pairs[:, :2]
             pairs = regularize_pairs(pairs)
             buffer_scales = pair_buffer_scales(pairs)
 
@@ -343,25 +376,24 @@ class EANNForce:
 
             dr_norm = jnp.linalg.norm(dr, axis=1)
 
-            buffer_scales2 = jnp.piecewise(buffer_scales, (dr_norm <= 6, dr_norm > 6),
-                            (lambda x: jnp.array(1), lambda x: jnp.array(0)))
+            buffer_scales2 = jnp.piecewise(
+                buffer_scales,
+                (dr_norm <= 6, dr_norm > 6),
+                (lambda x: jnp.array(1), lambda x: jnp.array(0)),
+            )
             buffer_scales = buffer_scales2 * buffer_scales
 
-            self.rs = params['rs']
-            self.inta = params['inta']
+            self.rs = params["rs"]
+            self.inta = params["inta"]
 
-            radial_i, radial_j = get_gto(dr_norm, pairs, self.rc, self.rs, self.inta, self.elem_indices)
-            radial = jnp.concatenate((radial_i,radial_j), axis=0)
-            orb_coeff = params['c'][self.elem_indices,:] # (48,16)
+            radial_i, radial_j = get_gto(
+                dr_norm, pairs, self.rc, self.rs, self.inta, self.elem_indices
+            )
+            radial = jnp.concatenate((radial_i, radial_j), axis=0)
+            orb_coeff = params["c"][self.elem_indices, :]  # (48,16)
 
             features = self.get_features(radial, dr, pairs, buffer_scales, orb_coeff)
             atomic_energies = get_atomic_energies(features, self.elem_indices, params)
-            return (atomic_energies + params['initpot'][0]).reshape(-1)
+            return (atomic_energies + params["initpot"][0]).reshape(-1)
 
         return get_charge
-
-
-
-
-
-

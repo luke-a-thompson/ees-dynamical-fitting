@@ -3,6 +3,7 @@ from typing import Optional, Literal
 import numpy as np
 import jax.numpy as jnp
 from jax.config import config
+
 config.update("jax_enable_x64", True)
 from jax_md import space
 import partition_int64 as partition
@@ -12,7 +13,18 @@ from dmff.utils import regularize_pairs
 
 
 class NeighborList:
-    def __init__(self, box, r_cutoff, covalent_map, dr_threshold=0, capacity_multiplier=1.25, format=Literal['dense', 'sparse', ]) -> None:
+    def __init__(
+        self,
+        box,
+        r_cutoff,
+        covalent_map,
+        dr_threshold=0,
+        capacity_multiplier=1.25,
+        format=Literal[
+            "dense",
+            "sparse",
+        ],
+    ) -> None:
         """wrapper of jax_md.space_periodic_general and jax_md.partition.NeighborList
 
         Args:
@@ -30,12 +42,16 @@ class NeighborList:
             box, fractional_coordinates=False
         )
         self.neighborlist_fn = partition.neighbor_list(
-            self.displacement_fn, box, r_cutoff, dr_threshold, format=partition.OrderedSparse
+            self.displacement_fn,
+            box,
+            r_cutoff,
+            dr_threshold,
+            format=partition.OrderedSparse,
         )
         self.nblist = None
-        
+
     def allocate(self, positions: jnp.ndarray, box: Optional[jnp.ndarray] = None):
-        """ A function to allocate a new neighbor list. This function cannot be compiled, since it uses the values of positions to infer the shapes.
+        """A function to allocate a new neighbor list. This function cannot be compiled, since it uses the values of positions to infer the shapes.
 
         Args:
             positions (jnp.ndarray): particle positions
@@ -48,9 +64,9 @@ class NeighborList:
         else:
             self.update(positions, box)
         return self.pairs
-    
+
     def update(self, positions: jnp.ndarray, box: Optional[jnp.ndarray] = None):
-        """ A function to update a neighbor list given a new set of positions and a previously allocated neighbor list.
+        """A function to update a neighbor list given a new set of positions and a previously allocated neighbor list.
 
         Args:
             positions (jnp.ndarray): particle positions
@@ -120,7 +136,7 @@ class NeighborListFreud:
         self.capacity_multiplier = None
         self.padding = padding
         self.cov_map = cov_map
-    
+
     def _do_cov_map(self, pairs):
         nbond = self.cov_map[pairs[:, 0], pairs[:, 1]]
         pairs = jnp.concatenate([pairs, nbond[:, None]], axis=1)
@@ -138,7 +154,7 @@ class NeighborListFreud:
         nlist = nlist[msk]
         if self.capacity_multiplier is None:
             self.capacity_multiplier = int(nlist.shape[0] * 1.3)
-        
+
         if not self.padding:
             self._pairs = self._do_cov_map(nlist)
             return self._pairs
@@ -149,7 +165,10 @@ class NeighborListFreud:
             self._pairs = self._do_cov_map(nlist)
             return self._pairs
         elif padding_width > 0:
-            padding = np.ones((self.capacity_multiplier - nlist.shape[0], 2), dtype=np.int32) * coords.shape[0]
+            padding = (
+                np.ones((self.capacity_multiplier - nlist.shape[0], 2), dtype=np.int32)
+                * coords.shape[0]
+            )
             nlist = np.vstack((nlist, padding))
             self._pairs = self._do_cov_map(nlist)
             return self._pairs
@@ -170,13 +189,3 @@ class NeighborListFreud:
     @property
     def positions(self):
         return self._positions
-
-
-
-
-
-
-
-
-
-
